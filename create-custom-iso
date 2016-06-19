@@ -1,0 +1,303 @@
+#!/bin/bash
+# set -x
+
+SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+
+print_help (){
+echo \
+"
+The script alters a Fedora or Centos installer image to run with serial console.
+
+If a kickstart file is provided, anaconda installer performes a fully automated
+installation.
+
+If a folder apu_tinycore containing the pcengines Tinycore Linux exists
+it's getting packed into the new iso image. The resulting iso image allows
+to choose between Fedora/Centos or Tinycore Linux at the boot prompt.
+
+-h|--help           Print this help
+-k|--ks-file        add a kickstart file to the image (relative path)
+-s|--no-serial      created image runs NOT on serial console instead of graphic card
+-a|--addon-folder   Add this folder to the iso image 
+-t|--tempdir        Use this directory for temporary data (default ${NS_TMPDIR}
+-d|--download-only  Just download the original Centos/Fedora image and exit
+-S|--image-suffix   Change suffix of iso file from _custom to _...
+-c|--centos         Create Centos Installer, not Fedora
+-T|--tinycore-dl    Prepare Tinycore Linux to be added to the iso as well.
+"
+}
+
+
+append_kernel_parameter(){
+	local cfg_file=${1}
+	local extenstion=${2}
+	local re=${3}
+	local re_not=${4}
+	(
+	IFS=''
+	while read line ; do
+		if [ ! -z $4 ]; then
+			[[ ! $line =~ $re_not ]] && [[ $line =~ $re ]] && line+="${extenstion}"
+		else
+			[[ $line =~ $re ]] && line+="${extenstion}"
+		fi
+		echo "$line" >> ${cfg_file}.new
+	done < ${cfg_file}
+	mv ${cfg_file}.new ${cfg_file}
+	)
+}
+
+
+create_iso_img(){
+	local iso_img_in=${1}
+	local iso_img_out=${2}
+	local ks_file=${3}
+	local addon_folder=${4}
+	local serial_console=${5}
+	local tmpdir=${6}
+	local image_label=${7}
+
+	local tmp_dir_orig="${tmpdir}/tmp_loop_mount_orig"
+	local tmp_dir_new="${tmpdir}/tmp_loop_mount_new"
+
+	# Create a directory to mount your source.
+	mkdir -p ${tmp_dir_orig} \
+	  || { echo "Error: Cannot create ${tmp_dir_orig}"; return 1; }
+	sudo mount -o loop ${iso_img_in} ${tmp_dir_orig} \
+	  || { echo "Error: Cannot mount ${iso_img_in}"; rmdir ${tmp_dir_orig}; return 1; }
+
+	#read -p "Press any key to continue after mounting original iso image..."
+
+	# Create a working directory for your customized media.
+	rm -rf ${tmp_dir_new}
+	mkdir ${tmp_dir_new} \
+	  || { echo "Error: Cannot create ${tmp_dir_new}"; sudo umount ${tmp_dir_orig} && rmdir ${tmp_dir_orig}; return 1; }
+	# Copy the source media to the working directory.
+	cp -r ${tmp_dir_orig}/* ${tmp_dir_new}/  \
+	  || { echo "Error: Cannot copy iso content to folder"; sudo umount ${tmp_dir_orig} && rmdir ${tmp_dir_orig}; rm -rf ${tmp_dir_new}; return 1; }
+	
+	# read -p "Press any key to continue with unmounting iso images..."
+	
+	# Unmount the source ISO and remove the directory.
+	sudo umount ${tmp_dir_orig} && rmdir ${tmp_dir_orig} \
+	  || { echo "Error: Cannot umount ${tmp_dir_orig}"; rm -rf ${tmp_dir_new}; return 1; }
+	# Change permissions on the working directory.
+	chmod -R u+w ${tmp_dir_new}                                || { echo "Error: Cannot change permissions of ${tmp_dir_new}"; rm -rf ${tmp_dir_new}; return 1; }
+
+	# Make this image using serial console instead of graphic card
+	cat << EOF > ${tmp_dir_new}/isolinux/isolinux.cfg
+UI menu.c32
+
+MENU TITLE Boot Menu
+TIMEOUT 600
+DEFAULT 1
+ 
+
+LABEL   1
+        MENU LABEL Boot from Harddisk
+       	LOCALBOOT 0
+       	TYPE 0x80
+
+LABEL   2
+        MENU LABEL Fedora Installer
+       	LINUX vmlinuz
+       	INITRD initrd.img
+       	APPEND inst.stage2=hd:LABEL=${image_label}
+EOF
+
+
+	# Copy tiny core linux
+	if [ -d ${tmpdir}/apu_tinycore ]; then
+		cp -r ${tmpdir}/apu_tinycore ${tmp_dir_new}
+		cat << EOF >> ${tmp_dir_new}/isolinux/isolinux.cfg
+
+LABEL   3
+        MENU LABEL ^tinyCore
+       	LINUX ../apu_tinycore/vmlinuz
+       	INITRD ../apu_tinycore/core.gz
+       	APPEND priority=low superuser noswap nodhcp embed nozswap blacklist=
+EOF
+	fi
+
+	# Copy Kickstart script and enable it at boot
+	if [ "x${ks_file}" != "x" ]; then
+		which ksvalidator > /dev/null && ( ksvalidator ${ks_file} ||  echo "Warning: Invalid kickstart file added" )
+	
+		ks_file_name=${ks_file##*/}
+		cp ${ks_file} ${tmp_dir_new}/${ks_file_name}               || { echo "Error: Cannot copy kickstart file"; rm -rf ${tmp_dir_new}; return 1; }
+		
+		# cdrom
+#		append_kernel_parameter "${tmp_dir_new}/isolinux/isolinux.cfg" " inst.ks=cdrom:/${ks_file}"
+# 		# USB Stick
+		cat << EOF >> ${tmp_dir_new}/isolinux/isolinux.cfg
+
+LABEL   4
+        MENU LABEL Fedora Kickstart Installer
+       	LINUX vmlinuz
+       	INITRD initrd.img
+       	APPEND inst.stage2=hd:LABEL=${image_label} inst.ks=hd:LABEL=${image_label}:/${ks_file_name}
+EOF
+	fi
+
+	chmod -R ugo+r ${tmp_dir_new}/isolinux/isolinux.cfg
+	chmod -R ugo+r ${tmp_dir_new}/apu_tinycore
+
+	if [ ${serial_console} -eq 1 ]; then
+		printf "SERIAL 0 115200 0\nCONSOLE 0\n" > "${tmp_dir_new}/isolinux/isolinux.cfg.new"
+		cat "${tmp_dir_new}/isolinux/isolinux.cfg" >> "${tmp_dir_new}/isolinux/isolinux.cfg.new"
+		mv "${tmp_dir_new}/isolinux/isolinux.cfg.new" "${tmp_dir_new}/isolinux/isolinux.cfg"
+		append_kernel_parameter "${tmp_dir_new}/isolinux/isolinux.cfg" " console=ttyS0,115200" "^\s*APPEND.*"
+	fi
+
+	# Copy addon folder
+	if [ "x${addon_folder}" != "x" ]; then
+		if [ -d ${addon_folder} ]; then
+			folder_in_iso=${tmp_dir_new}/$(basename $addon_folder)
+			mkdir -p ${folder_in_iso}
+			cp -r ${addon_folder}/* ${folder_in_iso}/  || { echo "Error: Cannot copy ${addon_folder}"; rm -rf ${tmp_dir_new}; return 1; }
+		else
+			echo "Warning: addon folder not found ${addon_folder}"
+		fi
+	fi
+
+	echo "Verify iso image content in folder ${tmp_dir_new}"
+	read -p "Press any key to continue with iso image generation..."
+
+	cp /usr/share/syslinux/*.c32 ${tmp_dir_new}/isolinux/
+	local himg="/usr/share/syslinux/isohdpfx.bin"
+	xorriso ${add_xorriso_par} -as mkisofs -disable-deep-relocation -R -J -joliet-long -V ${image_label} -o ${iso_img_out} \
+	-b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 \
+	-boot-info-table -isohybrid-mbr ${himg} ${tmp_dir_new} \
+	  || { echo "Error: Cannot create iso image in ${tmp_dir_new}"; return 1; }
+ 
+	rm -rf ${tmp_dir_new} || echo "Warning: Cannot delete folder ${tmp_dir_new}"
+}
+
+
+
+# CLI parameter default values
+SERIAL_CONSOLE=1
+KS_FILE=""
+ADDON_FOLDER=""
+NS_TMPDIR="${SCRIPT_DIR}/temp"
+DOWNLOAD_ONLY=0
+FORCED_INSTALL=0
+IMG_SUFFIX="custom"
+USE_FEDORA=1
+TINYCORE_DL=0
+
+if ! options=$(getopt -o hk:st:dFa:S:eT -l help,ks-file:,no-serial,tempdir:,download-only,forced-install,addon-folder:,image-suffix:,fedora,tinycore-dl -- "$@")
+then
+    # something went wrong, getopt will put out an error message for us
+    exit 1
+fi
+
+eval set -- $options
+
+while [ $# -gt 0 ]
+do
+  case $1 in
+  -k|--ks-file) KS_FILE=${2}; shift ;;
+  -a|--addon-folder) ADDON_FOLDER=${2}; shift ;;
+  -F|--forced-install) FORCED_INSTALL=1 ;;
+  -s|--no-serial) SERIAL_CONSOLE=0 ;;
+  -t|--tempdir) NS_TMPDIR=${2}; shift ;;
+  -S|--image-suffix) IMG_SUFFIX=${2}; shift ;;
+  -d|--download-only) DOWNLOAD_ONLY=1 ;;
+  -c|--centos) USE_FEDORA=0;;
+  -T|--tinycore-dl) TINYCORE_DL=1;;
+  -h|--help) print_help; exit 0 ;;
+  (--) shift; break;;
+  (-*) echo "$0: error - unrecognized option $1" 1>&2; exit 1;;
+  (*) break;;
+  esac
+  shift
+done
+
+mkdir -p ${NS_TMPDIR}
+
+SERVER_ARCH="x86_64"
+if [ ${USE_FEDORA} -eq 1 ]; then
+	DISTRO_TEST_FOLDER=""
+	DISTRO_NAME="Fedora"
+	DISTRO_FLAVOR="Server"
+	DISTRO_VERSION="23"
+	DISTRO_VERSION_R=""
+	DISTRO_ISO_IMG_FILE="${DISTRO_NAME}-${DISTRO_FLAVOR}-netinst-${SERVER_ARCH}-${DISTRO_VERSION}${DISTRO_VERSION_R}"
+	DISTRO_ISO_IMG_DL_URL="http://mirror.switch.ch/ftp/mirror/fedora/linux/releases/${DISTRO_TEST_FOLDER}${DISTRO_VERSION}/${DISTRO_FLAVOR}/${SERVER_ARCH}/iso/${DISTRO_ISO_IMG_FILE}.iso"
+	IMAGE_LABEL="${DISTRO_NAME}-S-${DISTRO_VERSION}-${SERVER_ARCH}"
+else
+	DISTRO_NAME="CentOS"
+	DISTRO_VERSION="7"
+	DISTRO_VERSION_MINOR="1511"
+	DISTRO_ISO_IMG_FILE="${DIST_NAME}-${DISTRO_VERSION}-${SERVER_ARCH}-Minimal-${DISTRO_VERSION_MINOR}.iso"
+	DISTRO_ISO_IMG_DL_URL="http://mirror.switch.ch/ftp/mirror/centos/${DISTRO_VERSION}/isos/${SERVER_ARCH}/${DISTRO_ISO_IMG_FILE}"
+	IMAGE_LABEL="${DISTRO_NAME}_${DISTRO_VERSION}_${SERVER_ARCH}"
+fi
+
+
+# Define the image filenames
+DISTRO_ISO_IMG_ORIG="${NS_TMPDIR}/${DISTRO_ISO_IMG_FILE}.iso"
+DISTRO_ISO_IMG_KS="${NS_TMPDIR}/${DISTRO_ISO_IMG_FILE}_${IMG_SUFFIX}.iso"
+KS_FILE=`readlink -f ${KS_FILE}`
+
+echo \
+"Create custom $DISTRO_NAME image
+  Downloading
+    from: $DISTRO_ISO_IMG_DL_URL
+    to:   $DISTRO_ISO_IMG_ORIG
+  kickstart file: $KS_FILE
+  custom image:
+    $DISTRO_ISO_IMG_KS
+"
+if [ ${TINYCORE_DL} -eq 1 ]; then
+	echo "  Including Tinycore Linux"
+fi
+read -p "Press any key to continue..."
+
+# Verify all required tools are available
+err=0
+which mkisofs > /dev/null || { echo "install mkisofs"; err=1; }
+which xorriso > /dev/null || { echo "install xorriso"; err=1; }
+which curl > /dev/null    || { echo "install curl"; err=1; }
+which unzip > /dev/null   || { echo "install unzip"; err=1; }
+if [ $err -ne 0 ]; then
+	exit 1
+fi
+
+if [ "x${KS_FILE}" != "x" ]; then
+	which ksvalidator > /dev/null
+	if [ $? -ne 0 ]; then
+		which ksvalidator > /dev/null || echo "Kickstart validator (package pykickstart) is highly recommended! Install ksvalidator."
+	fi
+fi
+
+if [ ${TINYCORE_DL} -eq 1 ]; then
+	if [ -d ${NS_TMPDIR}/apu_tinycore ]; then
+		echo "Skipping Tinycore Linux download, folder exists"
+	else
+		mkdir -p ${NS_TMPDIR}/apu_tinycore
+		curl -o ${NS_TMPDIR}/apu_tinycore.tar.bz2 http://pcengines.ch/file/apu2-tinycore6.4.tar.bz2
+		( cd ${NS_TMPDIR} && tar -xf apu_tinycore.tar.bz2 -C apu_tinycore )
+		curl -o ${NS_TMPDIR}/apu2_160311.zip http://www.pcengines.ch/file/apu2_160311.zip
+		unzip -d ${NS_TMPDIR}/apu_tinycore/ ${NS_TMPDIR}/apu2_160311.zip
+	fi
+fi
+
+# Download the original image
+if ! [ -e "${DISTRO_ISO_IMG_ORIG}" ] ; then
+	curl -o "${DISTRO_ISO_IMG_ORIG}" "${DISTRO_ISO_IMG_DL_URL}" || { echo "Error: Cannot download iso image from: ${DISTRO_ISO_IMG_DL_URL}"; exit 1; }
+else
+	echo "Skipping iso download, file exists"
+fi
+
+# write ISO names into a bash sourceable file for further scripts
+echo "DISTRO_ISO_IMG_ORIG=${DISTRO_ISO_IMG_ORIG}" > ${NS_TMPDIR}/isonames.cfg
+
+# Alter the image to perform automated installation
+if [ ${DOWNLOAD_ONLY}=0 ]; then
+	create_iso_img ${DISTRO_ISO_IMG_ORIG} ${DISTRO_ISO_IMG_KS} "${KS_FILE}" "${ADDON_FOLDER}" ${SERIAL_CONSOLE} "${NS_TMPDIR}" ${IMAGE_LABEL} || { echo "Error: Cannot create iso file including kickstart file"; exit 1; }
+	
+	echo "DISTRO_ISO_IMG_KS=${DISTRO_ISO_IMG_KS}" >> ${NS_TMPDIR}/isonames.cfg
+fi
